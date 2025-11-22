@@ -4,7 +4,9 @@ This file contains the calling Azure OpenAI's `/openai/realtime` endpoint.
 This requires websockets, and is currently only supported on LiteLLM Proxy.
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, cast
+
+from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
 
 from ....litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from ....litellm_core_utils.realtime_streaming import RealTimeStreaming
@@ -40,15 +42,16 @@ class AzureOpenAIRealtime(AzureChatCompletion):
         self,
         model: str,
         websocket: Any,
+        logging_obj: LiteLLMLogging,
         api_base: Optional[str] = None,
         api_key: Optional[str] = None,
         api_version: Optional[str] = None,
         azure_ad_token: Optional[str] = None,
         client: Optional[Any] = None,
-        logging_obj: Optional[LiteLLMLogging] = None,
         timeout: Optional[float] = None,
     ):
         import websockets
+        from websockets.asyncio.client import ClientConnection
 
         if api_base is None:
             raise ValueError("api_base is required for Azure OpenAI calls")
@@ -63,9 +66,10 @@ class AzureOpenAIRealtime(AzureChatCompletion):
                 extra_headers={
                     "api-key": api_key,  # type: ignore
                 },
+                max_size=REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES,
             ) as backend_ws:
                 realtime_streaming = RealTimeStreaming(
-                    websocket, backend_ws, logging_obj
+                    websocket, cast(ClientConnection, backend_ws), logging_obj
                 )
                 await realtime_streaming.bidirectional_forward()
 

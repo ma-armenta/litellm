@@ -15,10 +15,10 @@ from respx import MockRouter
 
 import litellm
 from litellm import Choices, Message, ModelResponse
-from base_llm_unit_tests import BaseLLMChatTest
+from base_llm_unit_tests import BaseLLMChatTest, BaseOSeriesModelsTest
 
 
-@pytest.mark.parametrize("model", ["o1-preview", "o1-mini", "o1"])
+@pytest.mark.parametrize("model", ["o1-mini", "o1"])
 @pytest.mark.asyncio
 async def test_o1_handle_system_role(model):
     """
@@ -68,7 +68,7 @@ async def test_o1_handle_system_role(model):
 
 @pytest.mark.parametrize(
     "model, expected_tool_calling_support",
-    [("o1-preview", False), ("o1-mini", False), ("o1", True)],
+    [("o1-mini", False), ("o1", True)],
 )
 @pytest.mark.asyncio
 async def test_o1_handle_tool_calling_optional_params(
@@ -96,7 +96,7 @@ async def test_o1_handle_tool_calling_optional_params(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["gpt-4", "gpt-4-0314", "gpt-4-32k", "o1-preview"])
+@pytest.mark.parametrize("model", ["gpt-4", "gpt-4-0314", "gpt-4-32k"])
 async def test_o1_max_completion_tokens(model: str):
     """
     Tests that:
@@ -152,11 +152,16 @@ def test_litellm_responses():
     assert isinstance(response.usage.completion_tokens_details, CompletionTokensDetails)
 
 
-class TestOpenAIO1(BaseLLMChatTest):
+class TestOpenAIO1(BaseOSeriesModelsTest, BaseLLMChatTest):
     def get_base_completion_call_args(self):
         return {
             "model": "o1",
         }
+
+    def get_client(self):
+        from openai import OpenAI
+
+        return OpenAI(api_key="fake-api-key")
 
     def test_tool_call_no_arguments(self, tool_call_no_arguments):
         """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
@@ -167,6 +172,26 @@ class TestOpenAIO1(BaseLLMChatTest):
         pass
 
 
+class TestOpenAIO3(BaseOSeriesModelsTest, BaseLLMChatTest):
+    def get_base_completion_call_args(self):
+        return {
+            "model": "o3-mini",
+        }
+
+    def get_client(self):
+        from openai import OpenAI
+
+        return OpenAI(api_key="fake-api-key")
+
+    def test_tool_call_no_arguments(self, tool_call_no_arguments):
+        """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
+        pass
+
+    def test_prompt_caching(self):
+        """Override, as o3 prompt caching is flaky"""
+        pass
+
+
 def test_o1_supports_vision():
     """Test that o1 supports vision"""
     os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
@@ -174,3 +199,36 @@ def test_o1_supports_vision():
     for k, v in litellm.model_cost.items():
         if k.startswith("o1") and v.get("litellm_provider") == "openai":
             assert v.get("supports_vision") is True, f"{k} does not support vision"
+
+
+def test_o3_reasoning_effort():
+    resp = litellm.completion(
+        model="o3-mini",
+        messages=[{"role": "user", "content": "Hello!"}],
+        reasoning_effort="high",
+    )
+    assert resp.choices[0].message.content is not None
+
+
+@pytest.mark.parametrize("model", ["o1", "o3-mini"])
+def test_streaming_response(model):
+    """Test that streaming response is returned correctly"""
+    from litellm import completion
+
+    response = completion(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Be a good bot!"},
+            {"role": "user", "content": "Hello!"},
+        ],
+        stream=True,
+    )
+
+    assert response is not None
+
+    chunks = []
+    for chunk in response:
+        chunks.append(chunk)
+
+    resp = litellm.stream_chunk_builder(chunks=chunks)
+    print(resp)

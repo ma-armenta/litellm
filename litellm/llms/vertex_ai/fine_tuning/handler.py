@@ -1,10 +1,9 @@
 import json
 import traceback
 from datetime import datetime
-from typing import Literal, Optional, Union
+from typing import Any, Coroutine, Literal, Optional, Union
 
 import httpx
-from openai.types.fine_tuning.fine_tuning_job import FineTuningJob
 
 import litellm
 from litellm._logging import verbose_logger
@@ -13,12 +12,14 @@ from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import Ver
 from litellm.types.fine_tuning import OpenAIFineTuningHyperparameters
 from litellm.types.llms.openai import FineTuningJobCreate
 from litellm.types.llms.vertex_ai import (
+    VERTEX_CREDENTIALS_TYPES,
     FineTuneHyperparameters,
     FineTuneJobCreate,
     FineTunesupervisedTuningSpec,
     ResponseSupervisedTuningSpec,
     ResponseTuningJob,
 )
+from litellm.types.utils import LiteLLMFineTuningJob
 
 
 class VertexFineTuningAPI(VertexLLM):
@@ -35,7 +36,6 @@ class VertexFineTuningAPI(VertexLLM):
 
     def convert_response_created_at(self, response: ResponseTuningJob):
         try:
-
             create_time_str = response.get("createTime", "") or ""
             create_time_datetime = datetime.fromisoformat(
                 create_time_str.replace("Z", "+00:00")
@@ -113,7 +113,7 @@ class VertexFineTuningAPI(VertexLLM):
 
     def convert_vertex_response_to_open_ai_response(
         self, response: ResponseTuningJob
-    ) -> FineTuningJob:
+    ) -> LiteLLMFineTuningJob:
         status: Literal[
             "validating_files", "queued", "running", "succeeded", "failed", "cancelled"
         ] = "queued"
@@ -134,13 +134,15 @@ class VertexFineTuningAPI(VertexLLM):
             response.get("supervisedTuningSpec", None) or {}
         )
         training_uri: str = _supervisedTuningSpec.get("trainingDatasetUri", "") or ""
-        return FineTuningJob(
+        return LiteLLMFineTuningJob(
             id=response.get("name", "") or "",
             created_at=created_at,
             fine_tuned_model=response.get("tunedModelDisplayName", ""),
             finished_at=None,
             hyperparameters=self._translate_vertex_response_hyperparameters(
-                vertex_hyper_parameters=_supervisedTuningSpec.get("hyperParameters", {})
+                vertex_hyper_parameters=_supervisedTuningSpec.get(
+                    "hyperParameters", FineTuneHyperparameters()
+                )
                 or {}
             ),
             model=response.get("baseModel", "") or "",
@@ -174,7 +176,6 @@ class VertexFineTuningAPI(VertexLLM):
         headers: dict,
         request_data: FineTuneJobCreate,
     ):
-
         try:
             verbose_logger.debug(
                 "about to create fine tuning job: %s, request_data: %s",
@@ -222,13 +223,12 @@ class VertexFineTuningAPI(VertexLLM):
         create_fine_tuning_job_data: FineTuningJobCreate,
         vertex_project: Optional[str],
         vertex_location: Optional[str],
-        vertex_credentials: Optional[str],
+        vertex_credentials: Optional[VERTEX_CREDENTIALS_TYPES],
         api_base: Optional[str],
         timeout: Union[float, httpx.Timeout],
         kwargs: Optional[dict] = None,
         original_hyperparameters: Optional[dict] = {},
-    ):
-
+    ) -> Union[LiteLLMFineTuningJob, Coroutine[Any, Any, LiteLLMFineTuningJob]]:
         verbose_logger.debug(
             "creating fine tuning job, args= %s", create_fine_tuning_job_data
         )

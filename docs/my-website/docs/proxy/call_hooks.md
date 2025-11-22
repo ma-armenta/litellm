@@ -6,6 +6,10 @@ import Image from '@theme/IdealImage';
 - Reject data before making llm api calls / before returning the response 
 - Enforce 'user' param for all openai endpoint calls
 
+:::tip
+**Understanding Callback Hooks?** Check out our [Callback Management Guide](../observability/callback_management.md) to understand the differences between proxy-specific hooks like `async_pre_call_hook` and general logging hooks like `async_log_success_event`.
+:::
+
 See a complete example with our [parallel request rate limiter](https://github.com/BerriAI/litellm/blob/main/litellm/proxy/hooks/parallel_request_limiter.py)
 
 ## Quick Start
@@ -18,7 +22,8 @@ This function is called just before a litellm completion call is made, and allow
 from litellm.integrations.custom_logger import CustomLogger
 import litellm
 from litellm.proxy.proxy_server import UserAPIKeyAuth, DualCache
-from typing import Optional, Literal
+from litellm.types.utils import ModelResponseStream
+from typing import Any, AsyncGenerator, Optional, Literal
 
 # This file includes the custom callbacks for LiteLLM Proxy
 # Once defined, these can be passed in proxy_config.yaml
@@ -44,7 +49,8 @@ class MyCustomHandler(CustomLogger): # https://docs.litellm.ai/docs/observabilit
         self, 
         request_data: dict,
         original_exception: Exception, 
-        user_api_key_dict: UserAPIKeyAuth
+        user_api_key_dict: UserAPIKeyAuth,
+        traceback_str: Optional[str] = None,
     ):
         pass
 
@@ -70,6 +76,21 @@ class MyCustomHandler(CustomLogger): # https://docs.litellm.ai/docs/observabilit
         response: str,
     ):
         pass
+
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: Any,
+        request_data: dict,
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        """
+        Passes the entire stream to the guardrail
+
+        This is useful for plugins that need to see the entire stream.
+        """
+        async for item in response:
+            yield item
+
 proxy_handler_instance = MyCustomHandler()
 ```
 
@@ -139,9 +160,6 @@ class MyCustomHandler(CustomLogger): # https://docs.litellm.ai/docs/observabilit
 
     #### ASYNC #### 
     
-    async def async_log_stream_event(self, kwargs, response_obj, start_time, end_time):
-        pass
-
     async def async_log_pre_api_call(self, model, messages, kwargs):
         pass
 

@@ -43,11 +43,10 @@ class GoogleBatchEmbeddings(VertexLLM):
         vertex_project=None,
         vertex_location=None,
         vertex_credentials=None,
-        aembedding=False,
+        aembedding: Optional[bool] = False,
         timeout=300,
         client=None,
     ) -> EmbeddingResponse:
-
         _auth_header, vertex_project = self._ensure_access_token(
             credentials=vertex_credentials,
             project_id=vertex_project,

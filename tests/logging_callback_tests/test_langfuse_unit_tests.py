@@ -21,6 +21,11 @@ from litellm.types.utils import (
     StandardLoggingMetadata,
     StandardLoggingHiddenParams,
     StandardCallbackDynamicParams,
+    ModelResponse,
+    Choices,
+    Message,
+    TextCompletionResponse,
+    TextChoices,
 )
 
 
@@ -294,7 +299,6 @@ def test_get_langfuse_tags():
     assert result == []
 
 
-
 @patch.dict(os.environ, {}, clear=True)  # Start with empty environment
 def test_get_langfuse_flush_interval():
     """
@@ -316,12 +320,14 @@ def test_get_langfuse_flush_interval():
         )
         assert result == 120
 
+
 def test_langfuse_e2e_sync(monkeypatch):
     from litellm import completion
     import litellm
     import respx
     import httpx
     import time
+    litellm.disable_aiohttp_transport = True # since this uses respx, we need to set use_aiohttp_transport to False
 
     litellm._turn_on_debug()
     monkeypatch.setattr(litellm, "success_callback", ["langfuse"])
@@ -343,3 +349,41 @@ def test_langfuse_e2e_sync(monkeypatch):
 
         assert langfuse_mock.called
 
+
+def test_get_chat_content_for_langfuse():
+    """
+    Test that _get_chat_content_for_langfuse correctly extracts content from chat completion responses
+    """
+    # Test with valid response
+    mock_response = ModelResponse(
+        choices=[Choices(message=Message(role="assistant", content="Hello world"))]
+    )
+
+    result = LangFuseLogger._get_chat_content_for_langfuse(mock_response)
+    assert result["content"] == "Hello world"
+    assert result["role"] == "assistant"
+
+    # Test with empty choices
+    mock_response = ModelResponse(choices=[])
+    result = LangFuseLogger._get_chat_content_for_langfuse(mock_response)
+    assert result is None
+
+
+def test_get_text_completion_content_for_langfuse():
+    """
+    Test that _get_text_completion_content_for_langfuse correctly extracts content from text completion responses
+    """
+    # Test with valid response
+    mock_response = TextCompletionResponse(choices=[TextChoices(text="Hello world")])
+    result = LangFuseLogger._get_text_completion_content_for_langfuse(mock_response)
+    assert result == "Hello world"
+
+    # Test with empty choices
+    mock_response = TextCompletionResponse(choices=[])
+    result = LangFuseLogger._get_text_completion_content_for_langfuse(mock_response)
+    assert result is None
+
+    # Test with no choices field
+    mock_response = TextCompletionResponse()
+    result = LangFuseLogger._get_text_completion_content_for_langfuse(mock_response)
+    assert result is None

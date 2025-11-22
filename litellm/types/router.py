@@ -4,17 +4,21 @@ litellm.Router Types - includes RouterConfig, UpdateRouterConfig, ModelInfo etc
 
 import datetime
 import enum
-import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, get_type_hints
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypedDict
 
-from ..exceptions import RateLimitError
+from litellm._uuid import uuid
+
 from .completion import CompletionRequest
 from .embedding import EmbeddingRequest
-from .utils import ModelResponse, ProviderSpecificModelInfo
+from .llms.openai import OpenAIFileObject
+from .llms.vertex_ai import VERTEX_CREDENTIALS_TYPES
+from .search import SearchProvider
+from .utils import CustomPricingLiteLLMParams, ModelResponse
 
 
 class ConfigurableClientsideParamsCustomAuth(TypedDict):
@@ -82,6 +86,7 @@ class UpdateRouterConfig(BaseModel):
     retry_after: Optional[float] = None
     fallbacks: Optional[List[dict]] = None
     context_window_fallbacks: Optional[List[dict]] = None
+    model_group_alias: Optional[Dict[str, Union[str, Dict]]] = {}
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -103,7 +108,15 @@ class ModelInfo(BaseModel):
         None  # specify if the base model is azure/gpt-3.5-turbo etc for accurate cost tracking
     )
     tier: Optional[Literal["free", "paid"]] = None
-    team_id: Optional[str] = None  # the team id that this model belongs to
+
+    """
+    Team Model Specific Fields
+    """
+    # the team id that this model belongs to
+    team_id: Optional[str] = None
+
+    # the model_name that can be used by the team when making LLM calls
+    team_public_model_name: Optional[str] = None
 
     def __init__(self, id: Optional[Union[str, int]] = None, **params):
         if id is None:
@@ -131,7 +144,26 @@ class ModelInfo(BaseModel):
         setattr(self, key, value)
 
 
-class GenericLiteLLMParams(BaseModel):
+class CredentialLiteLLMParams(BaseModel):
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
+    api_version: Optional[str] = None
+    ## VERTEX AI ##
+    vertex_project: Optional[str] = None
+    vertex_location: Optional[str] = None
+    vertex_credentials: Optional[Union[str, dict]] = None
+    ## UNIFIED PROJECT/REGION ##
+    region_name: Optional[str] = None
+
+    ## AWS BEDROCK / SAGEMAKER ##
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_region_name: Optional[str] = None
+    ## IBM WATSONX ##
+    watsonx_region_name: Optional[str] = None
+
+
+class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     """
     LiteLLM Params without 'model' arg (used across completion / assistants api)
     """
@@ -139,9 +171,6 @@ class GenericLiteLLMParams(BaseModel):
     custom_llm_provider: Optional[str] = None
     tpm: Optional[int] = None
     rpm: Optional[int] = None
-    api_key: Optional[str] = None
-    api_base: Optional[str] = None
-    api_version: Optional[str] = None
     timeout: Optional[Union[float, str, httpx.Timeout]] = (
         None  # if str, pass in as os.environ/
     )
@@ -151,25 +180,10 @@ class GenericLiteLLMParams(BaseModel):
     max_retries: Optional[int] = None
     organization: Optional[str] = None  # for openai orgs
     configurable_clientside_auth_params: CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS = None
+    litellm_credential_name: Optional[str] = None
+
     ## LOGGING PARAMS ##
     litellm_trace_id: Optional[str] = None
-    ## UNIFIED PROJECT/REGION ##
-    region_name: Optional[str] = None
-    ## VERTEX AI ##
-    vertex_project: Optional[str] = None
-    vertex_location: Optional[str] = None
-    vertex_credentials: Optional[str] = None
-    ## AWS BEDROCK / SAGEMAKER ##
-    aws_access_key_id: Optional[str] = None
-    aws_secret_access_key: Optional[str] = None
-    aws_region_name: Optional[str] = None
-    ## IBM WATSONX ##
-    watsonx_region_name: Optional[str] = None
-    ## CUSTOM PRICING ##
-    input_cost_per_token: Optional[float] = None
-    output_cost_per_token: Optional[float] = None
-    input_cost_per_second: Optional[float] = None
-    output_cost_per_second: Optional[float] = None
 
     max_file_size_mb: Optional[float] = None
 
@@ -177,7 +191,26 @@ class GenericLiteLLMParams(BaseModel):
     max_budget: Optional[float] = None
     budget_duration: Optional[str] = None
     use_in_pass_through: Optional[bool] = False
+    use_litellm_proxy: Optional[bool] = False
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+    merge_reasoning_content_in_choices: Optional[bool] = False
+    model_info: Optional[Dict] = None
+    mock_response: Optional[Union[str, ModelResponse, Exception, Any]] = None
+
+    # auto-router params
+    auto_router_config_path: Optional[str] = None
+    auto_router_config: Optional[str] = None
+    auto_router_default_model: Optional[str] = None
+    auto_router_embedding_model: Optional[str] = None
+
+    # Batch/File API Params
+    s3_bucket_name: Optional[str] = None
+    s3_encryption_key_id: Optional[str] = None
+    gcs_bucket_name: Optional[str] = None
+
+    # Vector Store Params
+    vector_store_id: Optional[str] = None
+    milvus_text_field: Optional[str] = None
 
     def __init__(
         self,
@@ -200,7 +233,7 @@ class GenericLiteLLMParams(BaseModel):
         ## VERTEX AI ##
         vertex_project: Optional[str] = None,
         vertex_location: Optional[str] = None,
-        vertex_credentials: Optional[str] = None,
+        vertex_credentials: Optional[VERTEX_CREDENTIALS_TYPES] = None,
         ## AWS BEDROCK / SAGEMAKER ##
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
@@ -217,6 +250,21 @@ class GenericLiteLLMParams(BaseModel):
         budget_duration: Optional[str] = None,
         # Pass through params
         use_in_pass_through: Optional[bool] = False,
+        # Dynamic param to force using litellm proxy
+        use_litellm_proxy: Optional[bool] = False,
+        # This will merge the reasoning content in the choices
+        merge_reasoning_content_in_choices: Optional[bool] = False,
+        model_info: Optional[Dict] = None,
+        mock_response: Optional[Union[str, ModelResponse, Exception, Any]] = None,
+        # auto-router params
+        auto_router_config_path: Optional[str] = None,
+        auto_router_config: Optional[str] = None,
+        auto_router_default_model: Optional[str] = None,
+        auto_router_embedding_model: Optional[str] = None,
+        # Batch/File API Params
+        s3_bucket_name: Optional[str] = None,
+        s3_encryption_key_id: Optional[str] = None,
+        gcs_bucket_name: Optional[str] = None,
         **params,
     ):
         args = locals()
@@ -226,7 +274,11 @@ class GenericLiteLLMParams(BaseModel):
         args.pop("__class__", None)
         if max_retries is not None and isinstance(max_retries, str):
             max_retries = int(max_retries)  # cast to int
-        super().__init__(max_retries=max_retries, **args, **params)
+        # We need to keep max_retries in args since it's a parameter of GenericLiteLLMParams
+        args["max_retries"] = (
+            max_retries  # Put max_retries back in args after popping it
+        )
+        super().__init__(**args, **params)
 
     def __contains__(self, key):
         # Define custom behavior for the 'in' operator
@@ -280,6 +332,7 @@ class LiteLLM_Params(GenericLiteLLMParams):
         max_file_size_mb: Optional[float] = None,
         # will use deployment on pass-through endpoints if True
         use_in_pass_through: Optional[bool] = False,
+        use_litellm_proxy: Optional[bool] = False,
         **params,
     ):
         args = locals()
@@ -289,7 +342,8 @@ class LiteLLM_Params(GenericLiteLLMParams):
         args.pop("__class__", None)
         if max_retries is not None and isinstance(max_retries, str):
             max_retries = int(max_retries)  # cast to int
-        super().__init__(max_retries=max_retries, **args, **params)
+        args["max_retries"] = max_retries
+        super().__init__(**{**args, **params})
 
     def __contains__(self, key):
         # Define custom behavior for the 'in' operator
@@ -421,7 +475,7 @@ class Deployment(BaseModel):
     def to_json(self, **kwargs):
         try:
             return self.model_dump(**kwargs)  # noqa
-        except Exception as e:
+        except Exception:
             # if using pydantic v1
             return self.dict(**kwargs)
 
@@ -513,6 +567,7 @@ class ModelGroupInfo(BaseModel):
     max_output_tokens: Optional[float] = None
     input_cost_per_token: Optional[float] = None
     output_cost_per_token: Optional[float] = None
+    input_cost_per_pixel: Optional[float] = None
     mode: Optional[
         Union[
             str,
@@ -531,13 +586,16 @@ class ModelGroupInfo(BaseModel):
     rpm: Optional[int] = None
     supports_parallel_function_calling: bool = Field(default=False)
     supports_vision: bool = Field(default=False)
+    supports_web_search: bool = Field(default=False)
+    supports_url_context: bool = Field(default=False)
+    supports_reasoning: bool = Field(default=False)
     supports_function_calling: bool = Field(default=False)
     supported_openai_params: Optional[List[str]] = Field(default=[])
     configurable_clientside_auth_params: CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS = None
 
     def __init__(self, **data):
         for field_name, field_type in get_type_hints(self.__class__).items():
-            if field_type == bool and data.get(field_name) is None:
+            if field_type is bool and data.get(field_name) is None:
                 data[field_name] = False
         super().__init__(**data)
 
@@ -547,8 +605,38 @@ class AssistantsTypedDict(TypedDict):
     litellm_params: LiteLLMParamsTypedDict
 
 
-class FineTuningConfig(BaseModel):
+class SearchToolLiteLLMParams(TypedDict, total=False):
+    """
+    LiteLLM params for search tools.
+    Search tools don't require a 'model' field like regular deployments.
+    """
 
+    search_provider: Required[SearchProvider]
+    api_key: Optional[str]
+    api_base: Optional[str]
+    timeout: Optional[Union[float, str, httpx.Timeout]]
+    max_retries: Optional[int]
+
+
+class SearchToolTypedDict(TypedDict):
+    """
+    Configuration for a search tool in the router.
+
+    Example:
+        {
+            "search_tool_name": "litellm-search",
+            "litellm_params": {
+                "search_provider": "perplexity",
+                "api_key": "os.environ/PERPLEXITYAI_API_KEY"
+            }
+        }
+    """
+
+    search_tool_name: Required[str]
+    litellm_params: Required[SearchToolLiteLLMParams]
+
+
+class FineTuningConfig(BaseModel):
     custom_llm_provider: Literal["azure", "openai"]
 
 
@@ -676,4 +764,62 @@ class GenericBudgetWindowDetails(BaseModel):
     ttl_seconds: int
 
 
-OptionalPreCallChecks = List[Literal["prompt_caching", "router_budget_limiting"]]
+OptionalPreCallChecks = List[
+    Literal[
+        "prompt_caching",
+        "router_budget_limiting",
+        "responses_api_deployment_check",
+        "forward_client_headers_by_model_group",
+    ]
+]
+
+
+class LiteLLM_RouterFileObject(TypedDict, total=False):
+    """
+    Tracking the litellm params hash, used for mapping the file id to the right model
+    """
+
+    litellm_params_sensitive_credential_hash: str
+    file_object: OpenAIFileObject
+
+
+@dataclass
+class MockRouterTestingParams:
+    mock_testing_fallbacks: Optional[bool] = None
+    mock_testing_context_fallbacks: Optional[bool] = None
+    mock_testing_content_policy_fallbacks: Optional[bool] = None
+
+    @classmethod
+    def from_kwargs(cls, kwargs: dict) -> "MockRouterTestingParams":
+        from litellm.secret_managers.main import str_to_bool
+
+        def extract_bool_param(name: str) -> Optional[bool]:
+            value = kwargs.pop(name, None)
+            return str_to_bool(value) if isinstance(value, str) else value
+
+        return cls(
+            mock_testing_fallbacks=extract_bool_param("mock_testing_fallbacks"),
+            mock_testing_context_fallbacks=extract_bool_param(
+                "mock_testing_context_fallbacks"
+            ),
+            mock_testing_content_policy_fallbacks=extract_bool_param(
+                "mock_testing_content_policy_fallbacks"
+            ),
+        )
+
+
+class ModelGroupSettings(BaseModel):
+    forward_client_headers_to_llm_api: Optional[List[str]] = None
+
+
+class PreRoutingHookResponse(BaseModel):
+    """
+    Response object from the pre-routing hook.
+
+    Allows the Pre-Routing Hook to return a modified model and messages.
+
+    Add fields that you expect to be modified by the pre-routing hook.
+    """
+
+    model: str
+    messages: Optional[List[Dict[str, str]]]

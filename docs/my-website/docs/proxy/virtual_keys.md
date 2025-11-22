@@ -1,5 +1,6 @@
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
+import Image from '@theme/IdealImage';
 
 # Virtual Keys
 Track Spend, and control model access via virtual keys for the proxy
@@ -23,7 +24,7 @@ Requirements:
   - ** Set on config.yaml** set your master key under `general_settings:master_key`, example below
   - ** Set env variable** set `LITELLM_MASTER_KEY`
 
-(the proxy Dockerfile checks if the `DATABASE_URL` is set and then intializes the DB connection)
+(the proxy Dockerfile checks if the `DATABASE_URL` is set and then initializes the DB connection)
 
 ```shell
 export DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<dbname>
@@ -333,7 +334,7 @@ curl http://localhost:4000/v1/chat/completions \
 
 **Expected Response**
 
-Expect to see a successfull response from the litellm proxy since the key passed in `X-Litellm-Key` is valid
+Expect to see a successful response from the litellm proxy since the key passed in `X-Litellm-Key` is valid
 ```shell
 {"id":"chatcmpl-f9b2b79a7c30477ab93cd0e717d1773e","choices":[{"finish_reason":"stop","index":0,"message":{"content":"\n\nHello there, how may I assist you today?","role":"assistant","tool_calls":null,"function_call":null}}],"created":1677652288,"model":"gpt-3.5-turbo-0125","object":"chat.completion","system_fingerprint":"fp_44709d6fcb","usage":{"completion_tokens":12,"prompt_tokens":9,"total_tokens":21}
 ```
@@ -392,55 +393,6 @@ curl -L -X POST 'http://0.0.0.0:4000/key/unblock' \
 }
 ```
 
-
-### Custom Auth 
-
-You can now override the default api key auth.
-
-Here's how: 
-
-#### 1. Create a custom auth file. 
-
-Make sure the response type follows the `UserAPIKeyAuth` pydantic object. This is used by for logging usage specific to that user key.
-
-```python
-from litellm.proxy._types import UserAPIKeyAuth
-
-async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth: 
-    try: 
-        modified_master_key = "sk-my-master-key"
-        if api_key == modified_master_key:
-            return UserAPIKeyAuth(api_key=api_key)
-        raise Exception
-    except: 
-        raise Exception
-```
-
-#### 2. Pass the filepath (relative to the config.yaml)
-
-Pass the filepath to the config.yaml 
-
-e.g. if they're both in the same dir - `./config.yaml` and `./custom_auth.py`, this is what it looks like:
-```yaml 
-model_list: 
-  - model_name: "openai-model"
-    litellm_params: 
-      model: "gpt-3.5-turbo"
-
-litellm_settings:
-  drop_params: True
-  set_verbose: True
-
-general_settings:
-  custom_auth: custom_auth.user_api_key_auth
-```
-
-[**Implementation Code**](https://github.com/BerriAI/litellm/blob/caf2a6b279ddbe89ebd1d8f4499f65715d684851/litellm/proxy/utils.py#L122)
-
-#### 3. Start the proxy
-```shell
-$ litellm --config /path/to/config.yaml 
-```
 
 ### Custom /key/generate
 
@@ -567,6 +519,149 @@ litellm_settings:
     metadata: {"setting":"default"}
     team_id: "core-infra"
 ```
+
+### ✨ Key Rotations 
+
+:::info
+
+This is an Enterprise feature.
+
+[Enterprise Pricing](https://www.litellm.ai/#pricing)
+
+[Get free 7-day trial key](https://www.litellm.ai/enterprise#trial)
+
+
+:::
+
+Rotate an existing API Key, while optionally updating its parameters.
+
+```bash
+
+curl 'http://localhost:4000/key/sk-1234/regenerate' \
+  -X POST \
+  -H 'Authorization: Bearer sk-1234' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "max_budget": 100,
+    "metadata": {
+      "team": "core-infra"
+    },
+    "models": [
+      "gpt-4",
+      "gpt-3.5-turbo"
+    ]
+  }'
+
+```
+
+**Read More**
+
+- [Write rotated keys to secrets manager](https://docs.litellm.ai/docs/secret#aws-secret-manager)
+
+[**👉 API REFERENCE DOCS**](https://litellm-api.up.railway.app/#/key%20management/regenerate_key_fn_key__key__regenerate_post)
+
+
+### Scheduled Key Rotations
+
+LiteLLM can rotate **virtual keys automatically** based on time intervals you define.
+
+#### Prerequisites
+
+1. **Database connection required** - Key rotation requires a connected database to track rotation schedules
+2. **Enable the rotation worker** - Set environment variable `LITELLM_KEY_ROTATION_ENABLED=true`
+3. **Configure check interval** - Optionally set `LITELLM_KEY_ROTATION_CHECK_INTERVAL_SECONDS` (default: 86400 seconds / 24 hours)
+
+#### How it works
+
+1. When creating a virtual key, set `auto_rotate: true` and `rotation_interval` (duration string)
+2. LiteLLM calculates the next rotation time as `now + rotation_interval` and stores it in the database
+3. A background job periodically checks for keys where the rotation time has passed
+4. When a key is due for rotation, LiteLLM automatically regenerates it and invalidates the old key string
+5. The new rotation time is calculated and the cycle continues
+
+#### Create a key with auto rotation
+
+**API**
+```bash
+curl 'http://0.0.0.0:4000/key/generate' \
+  -H 'Authorization: Bearer <your-master-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "models": ["gpt-4o"],
+        "auto_rotate": true,
+        "rotation_interval": "30d"
+      }'
+```
+
+**LiteLLM UI**
+
+On the LiteLLM UI, Navigate to the Keys page and click on `Generate Key` > `Key Lifecycle` > `Enable Auto Rotation`
+<Image 
+  img={require('../../img/key_r.png')}
+  style={{width: '30%', display: 'block', margin: '0'}}
+/>
+
+**Valid rotation_interval formats:**
+- `"30s"` - 30 seconds
+- `"30m"` - 30 minutes
+- `"30h"` - 30 hours
+- `"30d"` - 30 days
+- `"90d"` - 90 days
+
+#### Update existing key to enable rotation
+
+**API**
+
+```bash
+curl 'http://0.0.0.0:4000/key/update' \
+  -H 'Authorization: Bearer <your-master-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "key": "sk-existing-key",
+        "auto_rotate": true,
+        "rotation_interval": "90d"
+      }'
+```
+
+**LiteLLM UI**
+
+On the LiteLLM UI, Navigate to the Keys page. Select the key you want to update and click on `Edit Settings` > `Auto-Rotation Settings`
+
+<Image 
+  img={require('../../img/key_u.png')}
+  style={{width: '30%', display: 'block', margin: '0'}}
+/>
+
+#### Environment variables
+
+Set these environment variables when starting the proxy:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LITELLM_KEY_ROTATION_ENABLED` | Enable the rotation worker | `false` |
+| `LITELLM_KEY_ROTATION_CHECK_INTERVAL_SECONDS` | How often to scan for keys to rotate (in seconds) | `86400` (24 hours) |
+
+**Example:**
+```bash
+export LITELLM_KEY_ROTATION_ENABLED=true
+export LITELLM_KEY_ROTATION_CHECK_INTERVAL_SECONDS=3600  # Check every hour
+
+litellm --config config.yaml
+```
+
+### Temporary Budget Increase
+
+Use the `/key/update` endpoint to increase the budget of an existing key. 
+
+```bash
+curl -L -X POST 'http://localhost:4000/key/update' \
+-H 'Authorization: Bearer sk-1234' \
+-H 'Content-Type: application/json' \
+-d '{"key": "sk-b3Z3Lqdb_detHXSUp4ol4Q", "temp_budget_increase": 100, "temp_budget_expiry": "10d"}'
+```
+
+[API Reference](https://litellm-api.up.railway.app/#/key%20management/update_key_fn_key_update_post)
+
 
 ### Restricting Key Generation
 

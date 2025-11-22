@@ -1,29 +1,56 @@
 import asyncio
 import copy
 import os
+import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Literal, Optional, Union
+from typing import Dict, Literal, Optional, Union
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.constants import HEALTH_CHECK_TIMEOUT_SECONDS
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import (
     AlertType,
     CallInfo,
+    Litellm_EntityType,
     ProxyErrorTypes,
     ProxyException,
     UserAPIKeyAuth,
     WebhookEvent,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.health_check import perform_health_check
+from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.health_check import (
+    _clean_endpoint_data,
+    _update_litellm_params_for_health_check,
+    perform_health_check,
+    run_with_timeout,
+)
 
 #### Health ENDPOINTS ####
 
 router = APIRouter()
+services = Union[
+    Literal[
+        "slack_budget_alerts",
+        "langfuse",
+        "langfuse_otel",
+        "slack",
+        "openmeter",
+        "webhook",
+        "email",
+        "braintrust",
+        "datadog",
+        "generic_api",
+        "arize",
+        "sqs"
+    ],
+    str,
+]
 
 
 @router.get(
@@ -54,19 +81,7 @@ async def test_endpoint(request: Request):
 )
 async def health_services_endpoint(  # noqa: PLR0915
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
-    service: Union[
-        Literal[
-            "slack_budget_alerts",
-            "langfuse",
-            "slack",
-            "openmeter",
-            "webhook",
-            "email",
-            "braintrust",
-            "datadog",
-        ],
-        str,
-    ] = fastapi.Query(description="Specify the service being hit."),
+    service: services = fastapi.Query(description="Specify the service being hit."),
 ):
     """
     Use this admin-only endpoint to check if the service is healthy.
@@ -93,6 +108,7 @@ async def health_services_endpoint(  # noqa: PLR0915
             "slack_budget_alerts",
             "email",
             "langfuse",
+            "langfuse_otel",
             "slack",
             "openmeter",
             "webhook",
@@ -101,17 +117,21 @@ async def health_services_endpoint(  # noqa: PLR0915
             "custom_callback_api",
             "langsmith",
             "datadog",
+            "generic_api",
+            "arize",
+            "sqs"
         ]:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "error": f"Service must be in list. Service={service}. List={['slack_budget_alerts']}"
+                    "error": f"Service must be in list. Service={service} not in {services}"
                 },
             )
 
         if (
             service == "openmeter"
             or service == "braintrust"
+            or service == "generic_api"
             or (service in litellm.success_callback and service != "langfuse")
         ):
             _ = await litellm.acompletion(
@@ -135,6 +155,19 @@ async def health_services_endpoint(  # noqa: PLR0915
                     response["error_message"]
                     if response["status"] == "unhealthy"
                     else "Datadog is healthy"
+                ),
+            }
+        elif service == "arize":
+            from litellm.integrations.arize.arize import ArizeLogger
+
+            arize_logger = ArizeLogger()
+            response = await arize_logger.async_health_check()
+            return {
+                "status": response["status"],
+                "message": (
+                    response["error_message"]
+                    if response["status"] == "unhealthy"
+                    else "Arize is healthy"
                 ),
             }
         elif service == "langfuse":
@@ -161,11 +194,20 @@ async def health_services_endpoint(  # noqa: PLR0915
                 user_id=user_api_key_dict.user_id,
                 key_alias=user_api_key_dict.key_alias,
                 team_id=user_api_key_dict.team_id,
+                event_group=Litellm_EntityType.KEY,
             )
             await proxy_logging_obj.budget_alerts(
                 type="user_budget",
                 user_info=user_info,
             )
+        elif service == "sqs":
+            from litellm.integrations.sqs import SQSLogger
+            sqs_logger = SQSLogger()
+            response = await sqs_logger.async_health_check()
+            return {
+                "status": response["status"],
+                "message": response["error_message"],
+            }
 
         if service == "slack" or service == "slack_budget_alerts":
             if "slack" in general_settings.get("alerting", []):
@@ -244,7 +286,7 @@ async def health_services_endpoint(  # noqa: PLR0915
         if service == "email":
             webhook_event = WebhookEvent(
                 event="key_created",
-                event_group="key",
+                event_group=Litellm_EntityType.KEY,
                 event_message="Test Email Alert",
                 token=user_api_key_dict.token or "",
                 key_alias="Email Test key (This is only a test alert key. DO NOT USE THIS IN PRODUCTION.)",
@@ -289,11 +331,120 @@ async def health_services_endpoint(  # noqa: PLR0915
         )
 
 
+def _convert_health_check_to_dict(check) -> dict:
+    """Convert health check database record to dictionary format"""
+    return {
+        "health_check_id": check.health_check_id,
+        "model_name": check.model_name,
+        "model_id": check.model_id,
+        "status": check.status,
+        "healthy_count": check.healthy_count,
+        "unhealthy_count": check.unhealthy_count,
+        "error_message": check.error_message,
+        "response_time_ms": check.response_time_ms,
+        "details": check.details,
+        "checked_by": check.checked_by,
+        "checked_at": check.checked_at.isoformat() if check.checked_at else None,
+        "created_at": check.created_at.isoformat() if check.created_at else None,
+    }
+
+
+def _check_prisma_client():
+    """Helper to check if prisma_client is available and raise appropriate error"""
+    from litellm.proxy.proxy_server import prisma_client
+
+    if prisma_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "Database not initialized"},
+        )
+    return prisma_client
+
+
+async def _save_health_check_to_db(
+    prisma_client,
+    model_name: str,
+    healthy_endpoints: list,
+    unhealthy_endpoints: list,
+    start_time: float,
+    user_id: Optional[str],
+    model_id: Optional[str] = None,
+):
+    """Helper function to save health check results to database"""
+    try:
+        # Extract error message from first unhealthy endpoint if available
+        error_message = (
+            str(unhealthy_endpoints[0]["error"])[:500]
+            if unhealthy_endpoints and unhealthy_endpoints[0].get("error")
+            else None
+        )
+
+        await prisma_client.save_health_check_result(
+            model_name=model_name,
+            model_id=model_id,
+            status="healthy" if healthy_endpoints else "unhealthy",
+            healthy_count=len(healthy_endpoints),
+            unhealthy_count=len(unhealthy_endpoints),
+            error_message=error_message,
+            response_time_ms=(time.time() - start_time) * 1000,
+            details=None,  # Skip details for now to avoid JSON serialization issues
+            checked_by=user_id,
+        )
+    except Exception as db_error:
+        verbose_proxy_logger.warning(
+            f"Failed to save health check to database for model {model_name}: {db_error}"
+        )
+        # Continue execution - don't let database save failure break health checks
+
+
+async def _perform_health_check_and_save(
+    model_list,
+    target_model,
+    cli_model,
+    details,
+    prisma_client,
+    start_time,
+    user_id,
+    model_id=None,
+):
+    """Helper function to perform health check and save results to database"""
+    healthy_endpoints, unhealthy_endpoints = await perform_health_check(
+        model_list=model_list, cli_model=cli_model, model=target_model, details=details
+    )
+
+    # Optionally save health check result to database (non-blocking)
+    if prisma_client is not None:
+        # For CLI model, use cli_model name; for router models, use target_model
+        model_name_for_db = cli_model if cli_model is not None else target_model
+        if model_name_for_db is not None:
+            asyncio.create_task(
+                _save_health_check_to_db(
+                    prisma_client,
+                    model_name_for_db,
+                    healthy_endpoints,
+                    unhealthy_endpoints,
+                    start_time,
+                    user_id,
+                    model_id=model_id,
+                )
+            )
+
+    return {
+        "healthy_endpoints": healthy_endpoints,
+        "unhealthy_endpoints": unhealthy_endpoints,
+        "healthy_count": len(healthy_endpoints),
+        "unhealthy_count": len(unhealthy_endpoints),
+    }
+
+
 @router.get("/health", tags=["health"], dependencies=[Depends(user_api_key_auth)])
 async def health_endpoint(
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
     model: Optional[str] = fastapi.Query(
         None, description="Specify the model name (optional)"
+    ),
+    model_id: Optional[str] = fastapi.Query(
+        None, description="Specify the model ID (optional)"
     ),
 ):
     """
@@ -312,27 +463,62 @@ async def health_endpoint(
     ```
     else, the health checks will be run on models when /health is called.
     """
+    import time
+
     from litellm.proxy.proxy_server import (
         health_check_details,
         health_check_results,
         llm_model_list,
+        llm_router,
+        prisma_client,
         use_background_health_checks,
         user_model,
     )
+
+    start_time = time.time()
+
+    # Handle model_id parameter - convert to model name for health check
+    target_model = model
+    if model_id and not model:
+        # Use get_deployment from router to find the model name
+        if llm_router is not None:
+            try:
+                deployment = llm_router.get_deployment(model_id=model_id)
+                if deployment is not None:
+                    target_model = deployment.model_name
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail={"error": f"Model with ID {model_id} not found"},
+                    )
+            except Exception as e:
+                verbose_proxy_logger.error(
+                    f"Error getting deployment for model_id {model_id}: {e}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={"error": f"Model with ID {model_id} not found"},
+                )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": f"Model with ID {model_id} not found"},
+            )
 
     try:
         if llm_model_list is None:
             # if no router set, check if user set a model using litellm --model ollama/llama2
             if user_model is not None:
-                healthy_endpoints, unhealthy_endpoints = await perform_health_check(
-                    model_list=[], cli_model=user_model, details=health_check_details
+                return await _perform_health_check_and_save(
+                    model_list=[],
+                    target_model=None,
+                    cli_model=user_model,
+                    details=health_check_details,
+                    prisma_client=prisma_client,
+                    start_time=start_time,
+                    user_id=user_api_key_dict.user_id,
+                    model_id=None,  # CLI model doesn't have model_id
                 )
-                return {
-                    "healthy_endpoints": healthy_endpoints,
-                    "unhealthy_endpoints": unhealthy_endpoints,
-                    "healthy_count": len(healthy_endpoints),
-                    "unhealthy_count": len(unhealthy_endpoints),
-                }
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={"error": "Model list not initialized"},
@@ -346,16 +532,16 @@ async def health_endpoint(
         if use_background_health_checks:
             return health_check_results
         else:
-            healthy_endpoints, unhealthy_endpoints = await perform_health_check(
-                _llm_model_list, model, details=health_check_details
+            return await _perform_health_check_and_save(
+                model_list=_llm_model_list,
+                target_model=target_model,
+                cli_model=None,
+                details=health_check_details,
+                prisma_client=prisma_client,
+                start_time=start_time,
+                user_id=user_api_key_dict.user_id,
+                model_id=model_id,
             )
-
-            return {
-                "healthy_endpoints": healthy_endpoints,
-                "unhealthy_endpoints": unhealthy_endpoints,
-                "healthy_count": len(healthy_endpoints),
-                "unhealthy_count": len(unhealthy_endpoints),
-            }
     except Exception as e:
         verbose_proxy_logger.error(
             "litellm.proxy.proxy_server.py::health_endpoint(): Exception occured - {}".format(
@@ -364,6 +550,137 @@ async def health_endpoint(
         )
         verbose_proxy_logger.debug(traceback.format_exc())
         raise e
+
+
+@router.get(
+    "/health/history", tags=["health"], dependencies=[Depends(user_api_key_auth)]
+)
+async def health_check_history_endpoint(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    model: Optional[str] = fastapi.Query(
+        None, description="Filter by specific model name"
+    ),
+    status_filter: Optional[str] = fastapi.Query(
+        None, description="Filter by status (healthy/unhealthy)"
+    ),
+    limit: int = fastapi.Query(
+        100, description="Number of records to return", ge=1, le=1000
+    ),
+    offset: int = fastapi.Query(0, description="Number of records to skip", ge=0),
+):
+    """
+    Get health check history for models
+
+    Returns historical health check data with optional filtering.
+    """
+    prisma_client = _check_prisma_client()
+
+    try:
+        history = await prisma_client.get_health_check_history(
+            model_name=model,
+            limit=limit,
+            offset=offset,
+            status_filter=status_filter,
+        )
+
+        # Convert to dict format for JSON response using helper function
+        history_data = [_convert_health_check_to_dict(check) for check in history]
+
+        return {
+            "health_checks": history_data,
+            "total_records": len(history_data),
+            "limit": limit,
+            "offset": offset,
+        }
+    except Exception as e:
+        verbose_proxy_logger.error(f"Error getting health check history: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": f"Failed to retrieve health check history: {str(e)}"},
+        )
+
+
+@router.get(
+    "/health/latest", tags=["health"], dependencies=[Depends(user_api_key_auth)]
+)
+async def latest_health_checks_endpoint(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Get the latest health check status for all models
+
+    Returns the most recent health check result for each model.
+    """
+    prisma_client = _check_prisma_client()
+
+    try:
+        latest_checks = await prisma_client.get_all_latest_health_checks()
+
+        # Convert to dict format for JSON response using helper function
+        checks_data = {
+            (
+                check.model_id if check.model_id else check.model_name
+            ): _convert_health_check_to_dict(check)
+            for check in latest_checks
+        }
+
+        return {
+            "latest_health_checks": checks_data,
+            "total_models": len(checks_data),
+        }
+    except Exception as e:
+        verbose_proxy_logger.error(f"Error getting latest health checks: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": f"Failed to retrieve latest health checks: {str(e)}"},
+        )
+
+
+@router.get(
+    "/health/shared-status", tags=["health"], dependencies=[Depends(user_api_key_auth)]
+)
+async def shared_health_check_status_endpoint(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Get the status of shared health check coordination across pods.
+
+    Returns information about Redis connectivity, lock status, and cache status.
+    """
+    from litellm.proxy.proxy_server import redis_usage_cache, use_shared_health_check
+
+    if not use_shared_health_check:
+        return {
+            "shared_health_check_enabled": False,
+            "message": "Shared health check is not enabled",
+        }
+
+    if redis_usage_cache is None:
+        return {
+            "shared_health_check_enabled": True,
+            "redis_available": False,
+            "message": "Redis is not configured",
+        }
+
+    try:
+        from litellm.proxy.health_check_utils.shared_health_check_manager import (
+            SharedHealthCheckManager,
+        )
+
+        shared_health_manager = SharedHealthCheckManager(
+            redis_cache=redis_usage_cache,
+        )
+
+        health_status = await shared_health_manager.get_health_check_status()
+        return {"shared_health_check_enabled": True, "status": health_status}
+    except Exception as e:
+        verbose_proxy_logger.error(f"Error getting shared health check status: {e}")
+        raise HTTPException(
+            status_code=fastapi.status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": f"Failed to retrieve shared health check status: {str(e)}"
+            },
+        )
 
 
 db_health_cache = {"status": "unknown", "last_updated": datetime.now()}
@@ -375,19 +692,22 @@ async def _db_health_readiness_check():
     global db_health_cache
 
     # Note - Intentionally don't try/except this so it raises an exception when it fails
+    try:
+        # if timedelta is less than 2 minutes return DB Status
+        time_diff = datetime.now() - db_health_cache["last_updated"]
+        if db_health_cache["status"] != "unknown" and time_diff < timedelta(minutes=2):
+            return db_health_cache
 
-    # if timedelta is less than 2 minutes return DB Status
-    time_diff = datetime.now() - db_health_cache["last_updated"]
-    if db_health_cache["status"] != "unknown" and time_diff < timedelta(minutes=2):
+        if prisma_client is None:
+            db_health_cache = {"status": "disconnected", "last_updated": datetime.now()}
+            return db_health_cache
+
+        await prisma_client.health_check()
+        db_health_cache = {"status": "connected", "last_updated": datetime.now()}
         return db_health_cache
-
-    if prisma_client is None:
-        db_health_cache = {"status": "disconnected", "last_updated": datetime.now()}
+    except Exception as e:
+        PrismaDBExceptionHandler.handle_db_exception(e)
         return db_health_cache
-
-    await prisma_client.health_check()
-    db_health_cache = {"status": "connected", "last_updated": datetime.now()}
-    return db_health_cache
 
 
 @router.get(
@@ -523,6 +843,28 @@ async def health_readiness():
                     index_info = "index does not exist - error: " + str(e)
                 cache_type = {"type": cache_type, "index_info": index_info}
 
+        # build license metadata
+        try:
+            from litellm.proxy.proxy_server import _license_check  # type: ignore
+
+            license_available: bool = _license_check.is_premium() if _license_check else False
+            license_expiration: Optional[str] = None
+
+            if getattr(_license_check, "airgapped_license_data", None):
+                license_expiration = _license_check.airgapped_license_data.get(  # type: ignore[arg-type]
+                    "expiration_date"
+                )
+
+            license_metadata = {
+                "license": {
+                    "has_license": license_available,
+                    "expiration_date": license_expiration,
+                }
+            }
+        except Exception:
+            # fail closed: don't let license check break readiness
+            license_metadata = {"license": {"has_license": False, "expiration_date": None}}
+
         # check DB
         if prisma_client is not None:  # if db passed in, check if it's connected
             db_health_status = await _db_health_readiness_check()
@@ -532,6 +874,8 @@ async def health_readiness():
                 "cache": cache_type,
                 "litellm_version": version,
                 "success_callbacks": success_callback_names,
+                "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),
+                **license_metadata,
                 **db_health_status,
             }
         else:
@@ -541,6 +885,8 @@ async def health_readiness():
                 "cache": cache_type,
                 "litellm_version": version,
                 "success_callbacks": success_callback_names,
+                "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),
+                **license_metadata,
             }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Service Unhealthy ({str(e)})")
@@ -549,12 +895,10 @@ async def health_readiness():
 @router.get(
     "/health/liveliness",  # Historical LiteLLM name; doesn't match k8s terminology but kept for backwards compatibility
     tags=["health"],
-    dependencies=[Depends(user_api_key_auth)],
 )
 @router.get(
     "/health/liveness",  # Kubernetes has "liveness" probes (https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-a-liveness-command)
     tags=["health"],
-    dependencies=[Depends(user_api_key_auth)],
 )
 async def health_liveliness():
     """
@@ -583,12 +927,10 @@ async def health_readiness_options():
 @router.options(
     "/health/liveliness",
     tags=["health"],
-    dependencies=[Depends(user_api_key_auth)],
 )
 @router.options(
     "/health/liveness",  # Kubernetes has "liveness" probes (https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-a-liveness-command)
     tags=["health"],
-    dependencies=[Depends(user_api_key_auth)],
 )
 async def health_liveliness_options():
     """
@@ -600,3 +942,125 @@ async def health_liveliness_options():
         "Access-Control-Allow-Headers": "*",
     }
     return Response(headers=response_headers, status_code=200)
+
+
+@router.post(
+    "/health/test_connection",
+    tags=["health"],
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def test_model_connection(
+    request: Request,
+    mode: Optional[
+        Literal[
+            "chat",
+            "completion",
+            "embedding",
+            "audio_speech",
+            "audio_transcription",
+            "image_generation",
+            "video_generation",
+            "batch",
+            "rerank",
+            "realtime",
+            "responses",
+            "ocr",
+        ]
+    ] = fastapi.Body("chat", description="The mode to test the model with"),
+    litellm_params: Dict = fastapi.Body(
+        None,
+        description="Parameters for litellm.completion, litellm.embedding for the health check",
+    ),
+    model_info: Dict = fastapi.Body(
+        None,
+        description="Model info for the health check",
+    ),
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Test a direct connection to a specific model.
+    
+    This endpoint allows you to verify if your proxy can successfully connect to a specific model.
+    It's useful for troubleshooting model connectivity issues without going through the full proxy routing.
+    
+    Example:
+    ```bash
+    curl -X POST 'http://localhost:4000/health/test_connection' \\
+      -H 'Authorization: Bearer sk-1234' \\
+      -H 'Content-Type: application/json' \\
+      -d '{
+        "litellm_params": {
+            "model": "gpt-4",
+            "custom_llm_provider": "azure_ai",
+            "litellm_credential_name": null,
+            "api_key": "6xxxxxxx",
+            "api_base": "https://litellm8397336933.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21",
+        },
+        "mode": "chat"
+      }'
+    ```
+    
+    Returns:
+        dict: A dictionary containing the health check result with either success information or error details.
+    """
+    from litellm.proxy._types import CommonProxyErrors
+    from litellm.proxy.management_endpoints.model_management_endpoints import (
+        ModelManagementAuthChecks,
+    )
+    from litellm.proxy.proxy_server import premium_user, prisma_client
+    from litellm.types.router import Deployment, LiteLLM_Params
+
+    try:
+        if prisma_client is None:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": CommonProxyErrors.db_not_connected_error.value},
+            )
+        ## Auth check
+        await ModelManagementAuthChecks.can_user_make_model_call(
+            model_params=Deployment(
+                model_name="test_model",
+                litellm_params=LiteLLM_Params(**litellm_params),
+                model_info=model_info,
+            ),
+            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
+            premium_user=premium_user,
+        )
+        # Include health_check_params if provided
+        litellm_params = _update_litellm_params_for_health_check(
+            model_info={},
+            litellm_params=litellm_params,
+        )
+        mode = mode or litellm_params.pop("mode", None)
+
+        result = await run_with_timeout(
+            litellm.ahealth_check(
+                model_params=litellm_params,
+                mode=mode,
+                prompt="test from litellm",
+                input=["test from litellm"],
+            ),
+            HEALTH_CHECK_TIMEOUT_SECONDS,
+        )
+
+        # Clean the result for display
+        cleaned_result = _clean_endpoint_data(
+            {**litellm_params, **result}, details=True
+        )
+
+        return {
+            "status": "error" if "error" in result else "success",
+            "result": cleaned_result,
+        }
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        verbose_proxy_logger.debug(
+            f"litellm.proxy.health_endpoints.test_model_connection(): Exception occurred - {str(e)}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": f"Failed to test connection: {str(e)}"},
+        )

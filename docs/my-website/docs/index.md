@@ -89,7 +89,21 @@ response = completion(
 ```
 
 </TabItem>
+<TabItem value="xai" label="xAI">
 
+```python
+from litellm import completion
+import os
+
+## set ENV variables
+os.environ["XAI_API_KEY"] = "your-api-key"
+
+response = completion(
+  model="xai/grok-2-latest",
+  messages=[{ "content": "Hello, how are you?","role": "user"}]
+)
+```
+</TabItem>
 <TabItem value="vertex" label="VertexAI">
 
 ```python
@@ -97,8 +111,8 @@ from litellm import completion
 import os
 
 # auth: run 'gcloud auth application-default'
-os.environ["VERTEX_PROJECT"] = "hardy-device-386718"
-os.environ["VERTEX_LOCATION"] = "us-central1"
+os.environ["VERTEXAI_PROJECT"] = "hardy-device-386718"
+os.environ["VERTEXAI_LOCATION"] = "us-central1"
 
 response = completion(
   model="vertex_ai/gemini-1.5-pro",
@@ -195,6 +209,39 @@ response = completion(
 ```
 
 </TabItem>
+<TabItem value="novita" label="Novita AI">
+
+```python
+from litellm import completion
+import os
+
+## set ENV variables. Visit https://novita.ai/settings/key-management to get your API key
+os.environ["NOVITA_API_KEY"] = "novita-api-key"
+
+response = completion(
+  model="novita/deepseek/deepseek-r1",
+  messages=[{ "content": "Hello, how are you?","role": "user"}]
+)
+```
+
+</TabItem>
+
+<TabItem value="vercel" label="Vercel AI Gateway">
+
+```python
+from litellm import completion
+import os
+
+## set ENV variables. Visit https://vercel.com/docs/ai-gateway#using-the-ai-gateway-with-an-api-key for insturctions on obtaining a key
+os.environ["VERCEL_AI_GATEWAY_API_KEY"] = "your-vercel-api-key"
+
+response = completion(
+  model="vercel_ai_gateway/openai/gpt-4o",
+  messages=[{ "content": "Hello, how are you?","role": "user"}]
+)
+```
+
+</TabItem>
 
 </Tabs>
 
@@ -204,7 +251,7 @@ response = completion(
 {
     "id": "chatcmpl-565d891b-a42e-4c39-8d14-82a1f5208885",
     "created": 1734366691,
-    "model": "claude-3-sonnet-20240229",
+    "model": "gpt-4o-2024-08-06",
     "object": "chat.completion",
     "system_fingerprint": null,
     "choices": [
@@ -272,7 +319,22 @@ response = completion(
 ```
 
 </TabItem>
+<TabItem value="xai" label="xAI">
 
+```python
+from litellm import completion
+import os
+
+## set ENV variables
+os.environ["XAI_API_KEY"] = "your-api-key"
+
+response = completion(
+  model="xai/grok-2-latest",
+  messages=[{ "content": "Hello, how are you?","role": "user"}],
+  stream=True,
+)
+```
+</TabItem>
 <TabItem value="vertex" label="VertexAI">
 
 ```python
@@ -383,6 +445,41 @@ response = completion(
 ```
 
 </TabItem>
+<TabItem value="novita" label="Novita AI">
+
+```python
+from litellm import completion
+import os
+
+## set ENV variables. Visit https://novita.ai/settings/key-management to get your API key
+os.environ["NOVITA_API_KEY"] = "novita_api_key"
+
+response = completion(
+  model="novita/deepseek/deepseek-r1",
+  messages = [{ "content": "Hello, how are you?","role": "user"}],
+  stream=True,
+)
+```
+
+</TabItem>
+
+<TabItem value="vercel" label="Vercel AI Gateway">
+
+```python
+from litellm import completion
+import os
+
+## set ENV variables. Visit https://vercel.com/docs/ai-gateway#using-the-ai-gateway-with-an-api-key for insturctions on obtaining a key
+os.environ["VERCEL_AI_GATEWAY_API_KEY"] = "your-vercel-api-key"
+
+response = completion(
+  model="vercel_ai_gateway/openai/gpt-4o",
+  messages = [{ "content": "Hello, how are you?","role": "user"}],
+  stream=True,
+)
+```
+
+</TabItem>
 
 </Tabs>
 
@@ -427,6 +524,15 @@ try:
 except OpenAIError as e:
     print(e)
 ```
+### See How LiteLLM Transforms Your Requests
+
+Want to understand how LiteLLM parses and normalizes your LLM API requests? Use the `/utils/transform_request` endpoint to see exactly how your request is transformed internally.
+
+You can try it out now directly on our Demo App!
+Go to the [LiteLLM API docs for transform_request](https://litellm-api.up.railway.app/#/llm%20utils/transform_request_utils_transform_request_post)
+
+LiteLLM will show you the normalized, provider-agnostic version of your request. This is useful for debugging, learning, and understanding how LiteLLM handles different providers and options.
+
 
 ### Logging Observability - Log LLM Input/Output ([Docs](https://docs.litellm.ai/docs/observability/callbacks))
 LiteLLM exposes pre defined callbacks to send data to Lunary, MLflow, Langfuse, Helicone, Promptlayer, Traceloop, Slack
